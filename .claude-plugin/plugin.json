@@ -1,0 +1,1 @@
+{ "name": "vox", "version": "2.9.0", "description": "A quiet status line and switches for Claude's voice, sounds and hands-free listening", "author": { "name": "Chris Wijnia", "url": "https://chriswijnia.com" }, "license": "MIT", "homepage": "https://github.com/cwdx/vox", "types": "./types/index.d.ts" }

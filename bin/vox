@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+# Sounds and speech for Claude Code. Settings: ~/.claude/vox.json holds what the user changed, over the shipped
+# defaults in vox.default.json beside this script; a project's .claude/vox.json, then its
+# uncommitted .claude/vox.local.json, go over both. Sounds live in ~/.claude/sounds/pack.
+#   hooks:  vox send | tick | after | fail | notify | display | stop      (hook JSON on stdin)
+#   you:    vox on | off | status | voices | test [text] | demo [kind]
+#           vox use <kind> <sound>        kinds: think wait tick done fail chime send
+#           vox set <key> <value>         any key of vox.default.json
+#           vox listen on|off [pane]      the dictation helper
+#           vox state [session]           everything as one line of JSON, for the mod
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from collections import deque
+from pathlib import Path
+
+HOME = Path.home()
+CONF = HOME / ".claude" / "vox.json"
+DEFAULTS = Path(__file__).resolve().parent / "vox.default.json"
+SOUNDS = HOME / ".claude" / "sounds"
+PACK = SOUNDS / "pack"
+FIFO = SOUNDS / ".voice.fifo"
+PIDS = SOUNDS / ".think"
+HELPER = HOME / ".claude" / "hooks" / "vox-helper"
+PANE = os.environ.get("HERDR_PANE_ID", "")
+SYNTHS = "say|espeak-ng|piper|spd-say"
+DEVNULL = subprocess.DEVNULL
+
+# The platform's player and voice: macOS afplay and say; WSL the Windows ones through powershell.exe; Linux
+# PipeWire, PulseAudio or ALSA, and piper, espeak-ng or speech-dispatcher, whichever is installed.
+if sys.platform == "darwin":
+    OS = "mac"
+else:
+    try:
+        OS = "wsl" if "microsoft" in Path("/proc/version").read_text().lower() else "linux"
+    except OSError:
+        OS = "linux"
+
+
+def load_json(path):
+    try:
+        value = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def merge_dicts(base, over):
+    out = dict(base)
+    for key, value in over.items():
+        out[key] = merge_dicts(out[key], value) if isinstance(value, dict) and isinstance(out.get(key), dict) else value
+    return out
+
+
+def project_confs():  # the nearest project .claude/ with a vox.json or vox.local.json, short of the home folder
+    start = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()).resolve()
+    for folder in (start, *start.parents):
+        if folder == HOME.resolve():
+            return []
+        files = [folder / ".claude" / name for name in ("vox.json", "vox.local.json")]
+        if any(f.is_file() for f in files):
+            return files
+    return []
+
+
+def read_conf():
+    conf = merge_dicts(load_json(DEFAULTS), load_json(CONF))
+    for path in project_confs():
+        conf = merge_dicts(conf, load_json(path))
+    return conf
+
+
+def get_value(key):
+    value = read_conf()
+    for part in key.split("."):
+        value = value.get(part) if isinstance(value, dict) else None
+    return value
+
+
+def get_text(key):  # "" for unset, null and false, like jq's // empty
+    value = get_value(key)
+    return "" if value is None or value is False else str(value)
+
+
+def save_conf(path, value):
+    data = load_json(CONF)
+    node = data
+    parts = path.split(".")
+    for part in parts[:-1]:
+        if not isinstance(node.get(part), dict):
+            node[part] = {}
+        node = node[part]
+    node[parts[-1]] = value
+    tmp = CONF.with_name(CONF.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, CONF)
+
+
+def is_live():
+    return get_value("enabled") is True and os.environ.get("CLAUDE_CODE_ENTRYPOINT", "cli") == "cli"
+
+
+def has_command(name):
+    return shutil.which(name) is not None
+
+
+def run_quiet(argv, **kw):
+    try:
+        return subprocess.run(argv, stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, **kw).returncode == 0
+    except OSError:
+        return False
+
+
+def spawn_detached(argv, **kw):
+    try:
+        return subprocess.Popen(argv, stdin=DEVNULL, start_new_session=True, **kw)
+    except OSError:
+        return None
+
+
+def detach(fn):  # run fn in a forked process that outlives the hook
+    if os.fork():
+        return
+    try:
+        os.setsid()
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        fn()
+    except BaseException:
+        pass
+    finally:
+        os._exit(0)
+
+
+def make_temp_audio(ext):
+    fd, path = tempfile.mkstemp(prefix="vox-say.", suffix="." + ext, dir=os.environ.get("TMPDIR") or "/tmp")
+    os.close(fd)
+    return path
+
+
+def safe_name(value):
+    return str(value).replace("/", "_")
+
+
+def run_powershell(script):
+    return run_quiet(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script])
+
+
+def wsl_path(path):
+    return subprocess.run(["wslpath", "-w", str(path)], capture_output=True, text=True).stdout.strip()
+
+
+def build_player(path, volume):
+    if OS == "mac":
+        return ["afplay", "-v", str(volume), str(path)]
+    if OS == "wsl":
+        return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                f"(New-Object Media.SoundPlayer '{wsl_path(path)}').PlaySync()"]
+    if has_command("pw-play"):
+        return ["pw-play", "--volume", str(volume), str(path)]
+    if has_command("paplay"):
+        return ["paplay", "--volume", str(int(float(volume) * 65536)), str(path)]
+    return ["aplay", "-q", str(path)]
+
+
+def play(path, volume=1):
+    return run_quiet(build_player(path, volume))
+
+
+def volume_setting():
+    return get_value("volume") if isinstance(get_value("volume"), (int, float)) else 1
+
+
+def play_sound(kind):  # in the background, so the hook returns at once
+    if get_value("fx") is False:
+        return
+    spawn_detached(build_player(PACK / (get_text("sounds." + kind) + ".wav"), volume_setting()),
+                   stdout=DEVNULL, stderr=DEVNULL)
+
+
+def synth(text, file=None):  # speaks now, or writes the file the helper plays
+    voice, rate = get_text("voice"), get_text("rate")
+    if OS == "mac":
+        argv = ["say"] + (["-v", voice] if voice else []) + (["-r", rate] if rate else []) + (["-o", file] if file else [])
+        return run_quiet(argv + ["--", text])
+    if OS == "wsl":
+        quoted = text.replace("'", "''")
+        script = ("Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                  f"$s.Rate = {int((int(rate or 200) - 200) / 20)}; "
+                  + (f"$s.SelectVoice('{voice}'); " if voice else "")
+                  + (f"$s.SetOutputToWaveFile('{wsl_path(file)}'); " if file else "")
+                  + f"$s.Speak('{quoted}')")
+        return run_powershell(script)
+    model = get_text("piperModel")
+    if has_command("piper") and model:
+        target = file or make_temp_audio("wav")
+        try:
+            subprocess.run(["piper", "-m", model, "-f", target], input=text.encode(), stdout=DEVNULL, stderr=DEVNULL, check=True)
+        except (OSError, subprocess.CalledProcessError):
+            return False
+        if not file:
+            play(target)
+            os.unlink(target)
+        return True
+    if has_command("espeak-ng"):
+        argv = ["espeak-ng"] + (["-v", voice] if voice else []) + (["-s", rate] if rate else []) + (["-w", file] if file else [])
+        return run_quiet(argv + ["--", text])
+    if not file and has_command("spd-say"):
+        return run_quiet(["spd-say", "-w", "--", text])
+    return False
+
+
+# Speech goes through the helper when it runs, so its echo cancelling lets the user talk over it.
+def is_helper_running():
+    return run_quiet(["pgrep", "-f", "hooks/vox-helper/"]) and FIFO.is_fifo()
+
+
+def write_fifo(line):
+    try:
+        fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(fd, (line + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def start_helper(pane):
+    run_sh = HELPER / "run.sh"
+    if os.access(run_sh, os.X_OK):
+        spawn_detached([str(run_sh), pane], stdout=open(SOUNDS / ".voice.log", "a"), stderr=subprocess.STDOUT)
+
+
+def stop_speech():
+    run_quiet(["pkill", "-x", SYNTHS])
+    if OS == "wsl":
+        run_quiet(["pkill", "-f", "System.Speech"])
+    if is_helper_running():
+        write_fifo("stop")
+
+
+def speak(text, queue=False):  # at once, cutting off what plays; or queued after it, in order
+    if not queue:
+        stop_speech()
+    (SOUNDS / ".voice.speaker").write_text(PANE)
+    if is_helper_running():
+        file = make_temp_audio("aiff" if OS == "mac" else "wav")
+        if synth(text, file):
+            Path(file + ".txt").write_text(text)
+            write_fifo(("queue " if queue else "play ") + file)
+    else:
+        synth(text)
+
+
+# Several Claude sessions share one voice: only the herdr pane in focus speaks and pulses; the rest just chime.
+# With no Claude pane in focus (or no herdr), every session speaks.
+def is_focused():
+    if not PANE:
+        return True
+    try:
+        out = subprocess.run(["herdr", "pane", "list"], capture_output=True, text=True).stdout
+        panes = json.loads(out)["result"]["panes"]
+        focused = next(p["pane_id"] for p in panes if p.get("focused") and p.get("agent") == "claude")
+    except (OSError, ValueError, KeyError, TypeError, StopIteration):
+        return True
+    return focused == PANE
+
+
+# The thinking pulse runs from a prompt until the reply, one per session. An interrupted turn fires no hook,
+# so it also stops once the transcript has been quiet for 30 s, and after ten minutes.
+def start_thinking(session, transcript):
+    if get_value("think") is not True:
+        return
+    PIDS.mkdir(parents=True, exist_ok=True)
+    stop_thinking(session)
+    child = spawn_detached([sys.executable, os.path.abspath(__file__), "_think", session, transcript],
+                           stdout=DEVNULL, stderr=DEVNULL)
+    if child:
+        (PIDS / session).write_text(str(child.pid))
+
+
+def stop_thinking(session):
+    (PIDS / (session + ".wait")).unlink(missing_ok=True)
+    pid_file = PIDS / session
+    try:
+        pid = int(pid_file.read_text())
+    except (OSError, ValueError):
+        return
+    for kill in (os.killpg, os.kill):
+        try:
+            kill(pid, signal.SIGTERM)
+            break
+        except OSError:
+            continue
+    pid_file.unlink(missing_ok=True)
+
+
+def run_thinking_loop(session, transcript):
+    pid_file = PIDS / session
+    start = os.path.getsize(transcript) if transcript and os.path.exists(transcript) else 0
+    end = time.monotonic() + 600
+    try:
+        while time.monotonic() < end:
+            try:
+                quiet_for = time.time() - os.path.getmtime(transcript)
+            except OSError:
+                quiet_for = 0
+            if quiet_for >= 30:
+                break
+            try:
+                with open(transcript, "rb") as f:
+                    f.seek(start)
+                    if b"Request interrupted by user" in f.read():
+                        stop_speech()
+                        break
+            except OSError:
+                pass
+            if not is_focused():
+                time.sleep(2)
+                continue
+            kind = "wait" if (PIDS / (session + ".wait")).exists() else "think"
+            play(PACK / (get_text("sounds." + kind) + ".wav"), volume_setting())
+            time.sleep(max(float(get_value("thinkGap") or 0), 0.1))
+    finally:
+        try:
+            if pid_file.read_text() == str(os.getpid()):
+                pid_file.unlink()
+        except OSError:
+            pass
+
+
+# Markdown to speech: drop code, tables, links' URLs, and markup.
+def plain_text(text):
+    flags = re.A
+    for pattern, repl, extra in (
+        (r"```.*?```", "", re.S),
+        (r"^\s*#+ .*$", "", re.M),
+        (r"^\|.*\|\s*$", "", re.M),
+        (r"\[([^\]]*)\]\([^)]*\)", r"\1", 0),
+        (r"https?://\S+", "", 0),
+        (r"`([^`]*)`", r"\1", 0),
+        (r"^\s*(#+|[-*+]|\d+\.)\s+", "", re.M),
+        (r"[*_>#~]+", "", 0),
+        (r"[ \t]+", " ", 0),
+        (r"^\s+", "", 0),
+        (r"\s+$", "", 0),
+    ):
+        text = re.sub(pattern, repl, text, flags=flags | extra)
+    return text
+
+
+def trim_text(text):  # mode: first (first sentence) · short (first paragraph) · full; then at most maxChars
+    mode, limit = get_text("mode"), get_value("maxChars")
+    if mode == "first":
+        match = re.match(r"(.*?[.!?])(\s|$)", text, re.S)
+        text = match.group(1) if match else text
+    elif mode == "short":
+        text = re.split(r"\n\s*\n", text)[0]
+    if isinstance(limit, int) and len(text) > limit:
+        text = text[:limit]
+    return text.rstrip("\n")
+
+
+# What a tool call is doing, in a few words; a question with its numbered options.
+def describe_step(data):
+    tool, args = data.get("tool_name"), data.get("tool_input")
+    args = args if isinstance(args, dict) else {}
+    if tool == "AskUserQuestion":
+        parts = []
+        for q in args.get("questions") or []:
+            options = " ".join(f"Option {i + 1}: {o.get('label')}." for i, o in enumerate(q.get("options") or []))
+            parts.append(f"{q.get('question')} {options}")
+        return " ".join(parts)
+    description = args.get("description")
+    if description is not None and description is not False:
+        return str(description)
+    verb = {"Read": "Reading", "Edit": "Editing", "Write": "Writing", "Grep": "Searching", "Glob": "Finding files",
+            "WebFetch": "Fetching", "WebSearch": "Searching the web"}.get(tool)
+    if not verb:
+        return ""
+    path = args.get("file_path")
+    return verb + (" " + str(path).split("/")[-1] if path else "")
+
+
+def take_text(data, key, default=""):
+    value = data.get(key)
+    return default if value is None or value is False else str(value)
+
+
+def last_transcript_text(path):
+    last = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = deque(f, 200)
+    except OSError:
+        return last
+    for line in lines:
+        try:
+            entry = json.loads(line)
+            if entry.get("type") != "assistant":
+                continue
+            for block in entry["message"]["content"]:
+                if block.get("type") == "text":
+                    last = block.get("text") or ""
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return last
+
+
+def take_sentences(data):  # appends the delta; returns the finished sentences, keeping the rest buffered
+    folder = SOUNDS / ".msg"
+    folder.mkdir(parents=True, exist_ok=True)
+    lock = folder / "lock"
+    # a hook killed while holding the lock leaves it behind; after two seconds it is taken over
+    for _ in range(40):
+        try:
+            lock.mkdir()
+            break
+        except OSError:
+            time.sleep(0.05)
+    try:
+        buffer_file = folder / safe_name(data.get("message_id"))
+        with open(buffer_file, "a", encoding="utf-8") as f:
+            f.write(take_text(data, "delta"))
+        buf = buffer_file.read_text(encoding="utf-8", errors="replace").rstrip("\n")
+        if data.get("final") is True:
+            buffer_file.unlink(missing_ok=True)
+            return buf
+        match = re.match(r"(.*[.!?:])\s", buf, re.S | re.A)
+        head = match.group(1) if match else ""
+        buffer_file.write_text(buf[len(head):], encoding="utf-8")
+        return head
+    finally:
+        try:
+            lock.rmdir()
+        except OSError:
+            pass
+
+
+def run_hook(command, data):
+    session = safe_name(take_text(data, "session_id", "x"))
+    args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    if command == "send":
+        if is_focused():
+            stop_speech()
+        if not is_live():
+            return
+        if PANE:
+            if is_helper_running():
+                write_fifo("pane " + PANE)
+            else:
+                start_helper(PANE)
+        play_sound("send")
+        start_thinking(session, take_text(data, "transcript_path"))
+    elif command == "tick":
+        if not is_live():
+            return
+        # a blocking command swaps the thinking loop for the waiting heartbeat until it returns
+        if data.get("tool_name") == "Bash" and args.get("run_in_background") is not True and PIDS.is_dir():
+            (PIDS / (session + ".wait")).touch()
+        play_sound("tick")
+        # questions are always read, so the user can answer by number without looking; other steps only with narrate on
+        if (get_value("narrate") is True or data.get("tool_name") == "AskUserQuestion") and is_focused():
+            text = describe_step(data)
+            if text:
+                speak(text, queue=True)
+    elif command == "after":
+        (PIDS / (session + ".wait")).unlink(missing_ok=True)
+    elif command == "fail":
+        (PIDS / (session + ".wait")).unlink(missing_ok=True)
+        if is_live():
+            play_sound("fail")
+    elif command == "notify":
+        if not is_live():
+            return
+        stop_thinking(session)
+        play_sound("chime")
+        if get_value("notify") is True and is_focused():
+            message = take_text(data, "message", "Claude needs you")
+            detach(lambda: speak(message))
+    elif command == "display":
+        if not (is_live() and get_value("stream") is True and is_focused()):
+            return
+        text = plain_text(take_sentences(data))
+        if text:
+            speak(text, queue=True)
+    elif command == "stop":
+        stop_thinking(session)
+        if not is_live():
+            return
+        play_sound("done")
+        if get_value("stream") is True:
+            return
+        text = take_text(data, "last_assistant_message")
+        if not text and take_text(data, "transcript_path"):
+            text = last_transcript_text(take_text(data, "transcript_path"))
+        text = trim_text(plain_text(text))
+        if text and is_focused():
+            def speak_later():
+                time.sleep(0.6)
+                speak(text)
+            detach(speak_later)
+
+
+def read_hook_input():
+    try:
+        data = json.loads(sys.stdin.read())
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def build_state(session):
+    asr = load_json(SOUNDS / ".voice.state").get("asr") or {"status": "off"}
+    speaker = ""
+    try:
+        speaker = (SOUNDS / ".voice.speaker").read_text()
+    except OSError:
+        pass
+    # speaking and thinking are this pane's and session's own, so one session's pane never shows another's
+    playing = (SOUNDS / ".voice.playing").exists() or run_quiet(["pgrep", "-x", SYNTHS])
+    if session:
+        thinking = (PIDS / safe_name(session)).is_file()
+    else:
+        thinking = PIDS.is_dir() and any(PIDS.iterdir())
+    return {**read_conf(), "asrState": asr, "listening": is_helper_running(),
+            "speaking": bool(playing and (not PANE or speaker == PANE)), "thinking": thinking}
+
+
+def list_voices():
+    if OS == "mac":
+        out = subprocess.run(["say", "-v", "?"], capture_output=True, text=True).stdout
+        print("\n".join(line for line in out.splitlines() if "en_" in line))
+    elif OS == "wsl":
+        subprocess.run(["powershell.exe", "-NoProfile", "-Command", "Add-Type -AssemblyName System.Speech; "
+                        "(New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices().VoiceInfo.Name"])
+    elif not run_espeak_voices():
+        print("Install espeak-ng, or piper and set piperModel.")
+
+
+def run_espeak_voices():
+    try:
+        return subprocess.run(["espeak-ng", "--voices=en"], stderr=DEVNULL).returncode == 0
+    except OSError:
+        return False
+
+
+def run_demo(prefix):
+    for file in sorted(PACK.glob(prefix + "*.wav")):
+        name = file.stem
+        synth(name.replace("-", " "))
+        for _ in range(3):
+            play(file)
+            if not name.startswith("think-"):
+                break
+            time.sleep(float(get_value("thinkGap") or 0))
+
+
+def parse_value(raw):
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def print_json(value, compact=False):
+    print(json.dumps(value, separators=(",", ":")) if compact else json.dumps(value, indent=2))
+
+
+def main(argv):
+    CONF.parent.mkdir(parents=True, exist_ok=True)
+    if not CONF.exists():
+        CONF.write_text("{}\n")
+    command, rest = (argv[0] if argv else ""), argv[1:]
+    arg = lambda i: rest[i] if len(rest) > i else ""
+    if command in ("send", "tick", "after", "fail", "notify", "display", "stop"):
+        run_hook(command, read_hook_input())
+    elif command == "_think":
+        run_thinking_loop(arg(0), arg(1))
+    elif command == "demo":
+        run_demo(arg(0))
+    elif command == "use":
+        if not (PACK / (arg(1) + ".wav")).is_file():
+            print("\n".join(sorted(f.stem for f in PACK.glob("*.wav"))))
+            return 1
+        save_conf("sounds." + arg(0), arg(1))
+        play_sound(arg(0))
+    elif command == "listen":
+        pane = arg(1) or PANE
+        if arg(0) == "on" and not is_helper_running() and pane:
+            start_helper(pane)
+        elif arg(0) == "off":
+            run_quiet(["pkill", "-f", "hooks/vox-helper/"])
+    elif command == "state":
+        print_json(build_state(arg(0)), compact=True)
+    elif command in ("on", "off"):
+        save_conf("enabled", command == "on")
+        print_json(read_conf())
+    elif command == "set":
+        save_conf(arg(0), parse_value(arg(1)))
+        print_json(read_conf())
+    elif command == "status":
+        print_json(read_conf())
+    elif command == "voices":
+        list_voices()
+    elif command == "test":
+        text = arg(0) or "Speech is on. This is how replies will sound."
+        detach(lambda: speak(text))
+    else:
+        for line in Path(__file__).read_text().splitlines()[1:9]:
+            print(re.sub(r"^# ?", "", line))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

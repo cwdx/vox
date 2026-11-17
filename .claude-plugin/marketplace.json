@@ -1,0 +1,6 @@
+{
+  "name": "vox",
+  "description": "vox: voice for Claude Code",
+  "owner": { "name": "Chris Wijnia", "url": "https://chriswijnia.com" },
+  "plugins": [{ "name": "vox", "source": "./", "description": "Work with Claude Code by voice: speech, sounds, hands-free dictation and a live pane" }]
+}

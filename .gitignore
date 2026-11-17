@@ -1,0 +1,4 @@
+.build/
+helper/macos/vox-helper
+helper/linux/.venv/
+.claude-plugin/types/
