@@ -26,5 +26,5 @@ check() {
 [ -x helper/macos/.build/release/vox-helper ] && check helper/macos/.build/release/vox-helper --keyword
 py=${VOX_PYTHON:-python3}; "$py" -c "import numpy" 2>/dev/null && check "$py" helper/linux/helper.py --keyword
 echo '{}' > "$HOME/.claude/vox.json"
-[ -x helper/macos/.build/release/vox-helper ] && [ "$(helper/macos/.build/release/vox-helper --keyword "fix it")" = "fix it" ] || { echo "FAIL: auto listen passes everything"; fails=$((fails + 1)); }
+if [ -x helper/macos/.build/release/vox-helper ] && [ "$(helper/macos/.build/release/vox-helper --keyword "fix it")" != "fix it" ]; then echo "FAIL: auto listen passes everything"; fails=$((fails + 1)); fi
 [ $fails = 0 ] && echo "keyword: all ${#cases[@]} cases pass" || exit 1
